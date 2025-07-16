@@ -1,50 +1,43 @@
 #!/usr/bin/env bash
 set -euo pipefail
+IFS=$'\n\t'
 
 # Convert/move audio files from INPUT_DIR to OUTPUT_DIR
 #   Converts FLAC > MP3
 #   Copies MP3s
 #   Removes files from OUTPUT_DIR if deleted from INPUT_DIR
 
-# Global variables
+# User defined global variables
 INPUT_DIR="${INPUT_DIR:-/input}"
 OUTPUT_DIR="${OUTPUT_DIR:-/output}"
 LAME_QUALITY="${LAME_QUALITY:-0}"
 LOOP="${LOOP:-true}"
 SLEEP_TIME="${SLEEP_TIME:-900}"
-
-declare -A LOG_LEVELS=(["ERROR"]=0 ["WARN"]=1 ["INFO"]=2 ["DEBUG"]=3)
+STABILITY_CHECK_TIME="${STABILITY_CHECK_TIME:-2}"
+STABILITY_MAX_WAIT="${STABILITY_MAX_WAIT:-300}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
+
+# Immutable global variables
+declare -A LOG_LEVELS=(["ERROR"]=0 ["WARN"]=1 ["INFO"]=2 ["DEBUG"]=3)
 TMP_DIR=$(mktemp -d)
 
 # Logging helper
 log() {
   local level
   local message
+  local timestamp
 
   level=${1^^}
   message="$2"
+  timestamp=$(date '+%Y-%m-%d %H:%M:%S')
 
-  if [[ ${LOG_LEVELS[$level]} -le ${LOG_LEVELS[$CURRENT_LOG_LEVEL]} ]]; then
-    case $level in
-    "ERROR")
-      echo -e "[${level}] ${message}"
-      ;;
-    "WARN")
-      echo -e "[${level}] ${message}"
-      ;;
-    "INFO")
-      echo -e "[${level}] ${message}"
-      ;;
-    "DEBUG")
-      echo -e "[${level}] ${message}"
-      ;;
-    esac
+  if [[ ${LOG_LEVELS[$level]} -le ${LOG_LEVELS[$LOG_LEVEL]} ]]; then
+    echo -e "${timestamp} [${level}] ${message}"
   fi
 }
 
 setup_cleanup() {
-  trap 'rm -rf "${TMP_DIR}"; rm -f "${LOCK_FILE}"; exit' INT TERM EXIT
+  trap 'rm -rf "${TMP_DIR}"; exit' INT TERM EXIT
 }
 
 # Generate a list of flac and mp3 files, remove the extension so we can diff
@@ -58,10 +51,7 @@ generate_file_list() {
 
   log "DEBUG" "Generating file list for ${dir}"
 
-  find \
-    "${dir}" \
-    -type f \
-    \( -name "*.mp3" -o -name "*.flac" \) |
+  find "${dir}" -type f \( -iname "*.mp3" -o -iname "*.flac" \) |
     sed "s|^${dir}/||" |
     sed 's/\.[^.]*$//' |
     sort >"${TMP_DIR}/${list}"
@@ -81,6 +71,10 @@ remove_files() {
   local files_to_delete
 
   mapfile -t files_to_delete < <(grep -vxFf "${input_list}" "${output_list}" || true)
+
+  if [[ "${#files_to_delete[@]}" -gt 0 ]]; then
+    log "DEBUG" "Files to delete: ${files_to_delete[*]}"
+  fi
 
   log "DEBUG" "Checking for files to remove"
 
@@ -116,11 +110,18 @@ convert_file() {
     filetype="mp3"
     input_file="${input_file}.mp3"
   else
+    filetype="unknown"
     log "ERROR" "Unknown filetype for: ${input_file}"
   fi
 
-  # Convert to mp3
-  if [[ "${filetype}" == "flac" ]]; then
+  # Wait for file to become stable
+  if ! wait_for_file_stable "${input_file}" "${STABILITY_CHECK_TIME}" "${STABILITY_MAX_WAIT}"; then
+    log "WARN" "File not stable after maximum wait time, skipping: ${input_file}"
+    return
+  fi
+
+  case "${filetype,,}" in
+  flac)
     log "DEBUG" "Converting ${input_file}"
     if ! ffmpeg \
       -i "${input_file}" \
@@ -133,13 +134,18 @@ convert_file() {
       -loglevel error; then
       log "ERROR" "Failed to convert: ${input_file}"
     fi
-  fi
-
-  # Copy mp3
-  if [[ "${filetype}" == "mp3" ]]; then
+    ;;
+  mp3)
     log "DEBUG" "Moving ${input_file}"
-    cp "${input_file}" "${output_file}"
-  fi
+    if ! cp "${input_file}" "${output_file}"; then
+      log "ERROR" "Failed to copy ${input_file} to ${output_file}"
+    fi
+    ;;
+  *)
+    # handle files that go missing while processing
+    log "DEBUG" "Unknown file type for '${file}', skipping."
+    ;;
+  esac
 }
 
 process_files() {
@@ -161,7 +167,16 @@ process_files() {
 
   log "DEBUG" "Processing files"
 
-  mapfile -t files_to_process < <(grep -vxFf "${output_list}" "${input_list}" || true)
+  # If output list is empty, process all input files
+  if [[ ! -s "${output_list}" ]]; then
+    log "DEBUG" "Output list is empty, processing all files"
+    mapfile -t files_to_process <"${input_list}"
+  else
+    # Otherwise do the comparison
+    mapfile -t files_to_process < <(grep -vxFf "${output_list}" "${input_list}" || true)
+  fi
+
+  log "DEBUG" "Files to process count: ${#files_to_process[@]}"
 
   if [[ "${#files_to_process[@]}" -gt 0 ]]; then
     log "INFO" "Processing ${#files_to_process[@]} files"
@@ -182,10 +197,71 @@ process_files() {
   fi
 }
 
+# Wait for a file to become stable
+# Make sure we're not converting/copying a file which is in the process of being
+# written to or has been deleted
+wait_for_file_stable() {
+  local file
+  local check_interval
+  local max_wait
+
+  file="$1"
+  check_interval="${2:-5}"
+  max_wait="${3:-300}"
+
+  local start_time
+  local current_time
+  local size1
+  local size2
+
+  start_time=$(date +%s)
+
+  # Disable if check_interval is 0
+  if [[ "${check_interval}" -ne 0 ]]; then
+    while true; do
+      # Check if we've exceeded max wait time
+      current_time=$(date +%s)
+      if ((current_time - start_time > max_wait)); then
+        log "WARN" "Exceeded maximum wait time of ${max_wait}s for file: ${file}"
+        return 0
+      fi
+
+      # Check the file exists in case it has been deleted since we started
+      if [[ -f "${file}" ]]; then
+        size1=$(stat -c %s "${file}" 2>/dev/null || echo "0")
+
+        # Check for zero or very small files
+        if [[ "${size1}" == "0" ]] || [[ "${size1}" -lt 1024 ]]; then
+          log "ERROR" "Input file '${file}' is too small (${size1} bytes), skipping."
+          return 0
+        fi
+
+        sleep "${check_interval}"
+
+        size2=$(stat -c %s "${file}" 2>/dev/null || echo "0")
+
+        if [[ "${size1}" -eq "${size2}" ]]; then
+          return 0
+        elif [[ "${size1}" -gt "${size2}" ]]; then
+          # Handle degenerate case where the file is deleted during processing
+          log "WARN" "Input file '${file}' has gotten smaller, skipping."
+          return 0
+        fi
+      else
+        log "WARN" "Input file '${file}' does not exist, skipping."
+        return 0
+      fi
+
+      log "DEBUG" "File size changed from ${size1} to ${size2}, waiting: ${file}"
+    done
+  else
+    log "DEBUG" "STABILITY_CHECK_TIME set to 0, not running checks for file '${file}'."
+  fi
+}
+
 main() {
   log "INFO" "Starting music conversion process"
 
-  lock
   setup_cleanup
   generate_file_list "${INPUT_DIR}" "input"
   generate_file_list "${OUTPUT_DIR}" "output"
@@ -199,6 +275,7 @@ main() {
 if [[ "${LOOP}" == "true" ]]; then
   while true; do
     main
+    log "INFO" "Sleeping for ${SLEEP_TIME} seconds."
     sleep "${SLEEP_TIME}"
   done
 else
