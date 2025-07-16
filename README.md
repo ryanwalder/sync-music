@@ -71,7 +71,15 @@ Extra Environment Variables used by the container:
 
 <!-- markdownlint-disable MD013 -->
 
-`docker run -e PUID="1000" -e PGID="1000" -e UMASK="0022" -v /path/to/input/files:/input:ro -v /path/to/output/files:/output:rw ghcr.io/ryanwalder/sync-music:latest`
+```sh
+docker run \
+  -e PUID="1000" \
+  -e PGID="1000" \
+  -e UMASK="0022" \
+  -v /path/to/input/files:/input:ro \
+  -v /path/to/output/files:/output:rw \
+  ghcr.io/ryanwalder/sync-music:latest
+```
 
 <!-- markdownlint-enable -->
 
